@@ -16,7 +16,7 @@ EnvironmentFile=-/etc/rust_domain_searcher_api/rust_domain_searcher_api.env
 WorkingDirectory=/var/lib/rust_domain_searcher_api
 
 # Main executable
-ExecStart=/usr/local/bin/rust_domain_searcher_api -addr $ADDR -config $CONFIG
+ExecStart=/usr/local/bin/rust_domain_searcher_api --addr $ADDR --config $CONFIG
 
 # Restart policy
 Restart=always
