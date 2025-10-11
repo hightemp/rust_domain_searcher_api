@@ -1,0 +1,33 @@
+[Unit]
+Description=rust_domain_searcher_api HTTP service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# System user for the service (created by Makefile install target)
+User=rust_domain_searcher_api
+Group=rust_domain_searcher_api
+
+# Environment file with ADDR and CONFIG variables
+EnvironmentFile=-/etc/rust_domain_searcher_api/rust_domain_searcher_api.env
+
+# Working directory for the service (data/cache if needed)
+WorkingDirectory=/var/lib/rust_domain_searcher_api
+
+# Main executable
+ExecStart=/usr/local/bin/rust_domain_searcher_api -addr $ADDR -config $CONFIG
+
+# Restart policy
+Restart=always
+RestartSec=2s
+
+# Increase file descriptor limit for high concurrency
+LimitNOFILE=131072
+
+# Log to journald
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

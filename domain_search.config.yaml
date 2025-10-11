@@ -1,0 +1,43 @@
+version: 1
+
+generator:
+  # Full TLD list (IANA). If provided, overrides 'tlds' list.
+  # Official, frequently updated source:
+  # https://data.iana.org/TLD/tlds-alpha-by-domain.txt
+  tlds_file: "https://data.iana.org/TLD/tlds-alpha-by-domain.txt"
+  min_length: 1
+  max_length: 20
+  alphabet: "abcdefghijklmnopqrstuvwxyz0123456789-"
+  allow_hyphen: true
+  forbid_leading_hyphen: true
+  forbid_trailing_hyphen: true
+  forbid_double_hyphen: true
+
+limits:
+  concurrency: 30              # number of concurrent checks
+  rate_per_second: 300         # global RPS limit
+  max_candidates: 1000000000   # maximum generated domain names per pass
+
+http_check:
+  timeout: "3s"
+  retry: 0
+  method: "GET"
+  body_limit: "32KB"
+  accept_status_min: 200
+  accept_status_max: 1000
+  try_https_first: true
+
+run:
+  loop: false        # repeat the generation loop when max_candidates is reached
+
+# Persistent storage settings (adapted for rust_domain_searcher_api):
+storage:
+  # Directory to store per-TLD domain files (e.g., "ru.txt", "com.txt")
+  # For systemd deployment this matches /var/lib/rust_domain_searcher_api created by Makefile.
+  dir: "/var/lib/rust_domain_searcher_api/domains"
+
+  # If true, resume generation from the last saved position after restart.
+  resume: true
+
+  # Optional explicit path to a JSON state file. Defaults to "<dir>/state.json" if empty.
+  # state_file: "/var/lib/rust_domain_searcher_api/state.json"
