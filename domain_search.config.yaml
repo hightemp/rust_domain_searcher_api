@@ -20,7 +20,7 @@ limits:
 
 http_check:
   timeout: "3s"
-  retry: 0
+  retry: 3
   method: "GET"
   body_limit: "32KB"
   accept_status_min: 200

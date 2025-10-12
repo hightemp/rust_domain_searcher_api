@@ -9,13 +9,14 @@ BIN_DIR ?= ./bin
 CONFIG ?= ./domain_search.config.yaml
 ADDR ?= :8082
 
-.PHONY: help tidy fmt test build run reset build-linux build-macos build-windows clean
+.PHONY: help tidy fmt test build run run-debug reset build-linux build-macos build-windows clean
 .PHONY: install uninstall purge service-start service-stop service-restart service-status logs
 
 help:
 	@echo "Targets:"
 	@echo "  make build            - Build $(BIN) into $(BIN_DIR)/"
 	@echo "  make run              - Run API (ADDR=$(ADDR), CONFIG=$(CONFIG))"
+	@echo "  make run-debug        - Run API with RUST_LOG=debug (ADDR=$(ADDR), CONFIG=$(CONFIG))"
 	@echo "  make reset            - Reset storage (delete domain files and state), then exit"
 	@echo "  make tidy             - Update Cargo.lock (cargo update)"
 	@echo "  make fmt              - cargo fmt"
@@ -52,6 +53,9 @@ build:
 
 run:
 	$(CARGO) run -- --addr $(ADDR) --config $(CONFIG)
+
+run-debug:
+	RUST_LOG=debug RUST_BACKTRACE=1 $(CARGO) run -- --addr $(ADDR) --config $(CONFIG)
 
 reset:
 	$(CARGO) run -- --config $(CONFIG) --reset
