@@ -185,7 +185,6 @@ struct StatsResp {
     total_planned: i64,
     domains_memory_bytes: u64,
     domains_memory_human: String,
-    go_mem_alloc_bytes: u64, // not applicable in Rust; keep 0 for compatibility
 }
 
 fn human_bytes(n: u64) -> String {
@@ -274,7 +273,6 @@ async fn stats_handler(prog: Arc<Progress>, store: DomainStore) -> impl IntoResp
         total_planned,
         domains_memory_bytes: dom_bytes,
         domains_memory_human: human_bytes(dom_bytes),
-        go_mem_alloc_bytes: 0,
     };
     (StatusCode::OK, Json(resp))
 }

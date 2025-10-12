@@ -40,4 +40,4 @@ storage:
   resume: true
 
   # Optional explicit path to a JSON state file. Defaults to "<dir>/state.json" if empty.
-  # state_file: "/var/lib/rust_domain_searcher_api/state.json"
+  state_file: "/var/lib/rust_domain_searcher_api/state.json"
