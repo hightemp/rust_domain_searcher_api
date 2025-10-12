@@ -6,7 +6,7 @@ SHELL := /bin/bash
 CARGO ?= cargo
 BIN ?= rust_domain_searcher_api
 BIN_DIR ?= ./bin
-CONFIG ?= ../domain_search.config.yaml
+CONFIG ?= ./domain_search.config.yaml
 ADDR ?= :8082
 
 .PHONY: help tidy fmt test build run reset build-linux build-macos build-windows clean
