@@ -12,7 +12,7 @@ use parking_lot::RwLock;
 use once_cell::sync::OnceCell;
 use reqwest::{Client, Method};
 use tokio::{select, sync::{mpsc, Semaphore}, time};
-use tracing::{error, info};
+use tracing::{error, info, debug, warn};
 
 use crate::config::{Config, GeneratorConfig, HTTPCheckConfig};
 use crate::progress::Progress;
@@ -70,11 +70,13 @@ pub async fn run_service(
             }
         });
     }
+    info!("rps limiter: {} tokens/sec", rps);
 
     // Concurrency limiter
     let nw = cfg.limits.concurrency.max(1) as usize;
     let conc = Arc::new(Semaphore::new(nw));
-
+    info!("concurrency limiter: {} workers", nw);
+ 
     // Single consumer that dispatches per-domain tasks respecting concurrency
     {
         let store = store.clone();
@@ -113,11 +115,16 @@ pub async fn run_service(
     } else {
         PathBuf::from(&cfg.storage.state_file)
     };
+    info!("resume: enabled={}, state_file={}", cfg.storage.resume, state_path.display());
     let last = last_domain_cell();
     if cfg.storage.resume {
         if let Ok(s) = std::fs::read_to_string(&state_path) {
             if let Ok(st) = serde_json::from_str::<ResumeState>(&s) {
-                *last.write() = st.last_domain.trim().to_string();
+                let ld = st.last_domain.trim().to_string();
+                if !ld.is_empty() {
+                    info!("resume: loaded last='{}'", ld);
+                }
+                *last.write() = ld;
             }
         }
         // periodic saver
@@ -131,6 +138,7 @@ pub async fn run_service(
                 let cur = last_for_saver.read().clone();
                 if !cur.is_empty() && cur != prev {
                     let _ = save_resume(&state_path_clone, &cur);
+                    debug!("resume: saved last='{}'", cur);
                     prev = cur;
                 }
             }
@@ -141,6 +149,7 @@ pub async fn run_service(
     // generator executed inside the select! loop below to avoid non-Send captures
 
     // Loop control: race generation against shutdown without spawning non-Send futures
+    info!("service entering main loop");
     loop {
         let cfg_gen = cfg.generator.clone();
         let tx_gen = tx.clone();
@@ -152,14 +161,19 @@ pub async fn run_service(
                 break;
             }
             _ = async {
-                if let Err(e) = generate_candidates(cfg_gen, last_for_gen.read().clone(), |d| {
+                let resume_from = last_for_gen.read().clone();
+                info!("generator start: resume_from='{}'", resume_from);
+                if let Err(e) = generate_candidates(cfg_gen, resume_from, |d| {
                     // report last domain
                     *last_for_gen.write() = d.to_string();
                     // send candidate (drop silently if channel is full)
                     match tx_gen.try_send(d.to_string()) {
                         Ok(_) => {
                             sent += 1;
+                            // track enqueue for stats
+                            prog.inc_enqueued();
                             if cfg.limits.max_candidates > 0 && sent >= cfg.limits.max_candidates as i64 {
+                                info!("generator hit max_candidates={}, stopping pass", cfg.limits.max_candidates);
                                 return false;
                             }
                             true
@@ -168,6 +182,8 @@ pub async fn run_service(
                     }
                 }).await {
                     error!("generator error: {e}");
+                } else {
+                    info!("generator finished: enqueued_sent={}", sent);
                 }
             } => {
                 if !cfg.run.loop_ {
@@ -205,24 +221,30 @@ async fn check_domain(client: &Client, domain: &str, hc: &HTTPCheckConfig) -> an
             let url = format!("{scheme}://{domain}/");
             let req = client.request(method.clone(), &url).build()?;
             let resp = client.execute(req).await;
-            if let Ok(resp) = resp {
-                let status = resp.status().as_u16() as i32;
-                // read limited body (stream chunks)
-                let mut stream = resp.bytes_stream();
-                let mut read: u64 = 0;
-                let limit = hc.body_limit.bytes.max(1);
-                while let Some(chunk) = stream.next().await {
-                    let bytes = match chunk {
-                        Ok(b) => b,
-                        Err(_) => break,
-                    };
-                    read = read.saturating_add(bytes.len() as u64);
-                    if read >= limit {
-                        break;
+            match resp {
+                Ok(resp) => {
+                    let status = resp.status().as_u16() as i32;
+                    // read limited body (stream chunks)
+                    let mut stream = resp.bytes_stream();
+                    let mut read: u64 = 0;
+                    let limit = hc.body_limit.bytes.max(1);
+                    while let Some(chunk) = stream.next().await {
+                        let bytes = match chunk {
+                            Ok(b) => b,
+                            Err(_) => break,
+                        };
+                        read = read.saturating_add(bytes.len() as u64);
+                        if read >= limit {
+                            break;
+                        }
+                    }
+                    if status >= hc.accept_status_min && status <= hc.accept_status_max {
+                        debug!("reachable: {} status={}", url, status);
+                        return Ok(true);
                     }
                 }
-                if status >= hc.accept_status_min && status <= hc.accept_status_max {
-                    return Ok(true);
+                Err(e) => {
+                    debug!("request error for {}: {}", url, e);
                 }
             }
         }

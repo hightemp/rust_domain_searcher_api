@@ -53,6 +53,11 @@ async fn main() -> anyhow::Result<()> {
 
     // config
     let cfg: Config = config::load_config(&args.config).await?;
+    info!(
+        "configuration loaded: storage.dir={}, tlds_count={}",
+        &cfg.storage.dir,
+        cfg.generator.tlds.len()
+    );
     fs::create_dir_all(&cfg.storage.dir)?;
 
     // storage
@@ -100,6 +105,15 @@ async fn main() -> anyhow::Result<()> {
                 move || stats_handler(p.clone(), st.clone())
             }),
         )
+        // also accept without trailing slash for compatibility
+        .route(
+            "/stats",
+            get({
+                let p = prog_arc.clone();
+                let st = store.clone();
+                move || stats_handler(p.clone(), st.clone())
+            }),
+        )
         .route(
             "/domain/*path",
             get({
@@ -109,6 +123,13 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/tlds/",
+            get({
+                let tlds = tlds.clone();
+                move || tlds_handler(tlds.clone())
+            }),
+        )
+        .route(
+            "/tlds",
             get({
                 let tlds = tlds.clone();
                 move || tlds_handler(tlds.clone())
@@ -201,6 +222,7 @@ fn fmt_duration(d: Duration) -> String {
 }
 
 async fn stats_handler(prog: Arc<Progress>, store: DomainStore) -> impl IntoResponse {
+    info!("stats requested");
     let (enq, chk, fnd, elapsed) = prog.snapshot();
     let elapsed_sec = elapsed.as_secs_f64();
     let speed = if elapsed_sec > 0.0 {
@@ -271,6 +293,7 @@ async fn domain_handler(AxPath(path): AxPath<String>, store: DomainStore) -> Res
     }
     let tld = path[..dot].to_lowercase();
     let ext = path[dot + 1..].to_lowercase();
+    info!("domain requested: path={}, tld={}, ext={}", path, tld, ext);
 
     let list = if tld == "__all__" {
         store.list_all()
@@ -300,6 +323,7 @@ async fn domain_handler(AxPath(path): AxPath<String>, store: DomainStore) -> Res
 }
 
 async fn tlds_handler(cfg_tlds: Arc<Vec<String>>) -> impl IntoResponse {
+    info!("tlds requested");
     let mut uniq = std::collections::BTreeSet::new();
     for t in cfg_tlds.iter() {
         let mut s = t.trim().to_lowercase();

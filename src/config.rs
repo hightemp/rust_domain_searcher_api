@@ -5,6 +5,7 @@ use serde::{Deserialize, Deserializer};
 use serde_yaml as yaml;
 
 use anyhow::Context;
+use tracing::{info, warn, error};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -180,12 +181,23 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 // -------- TLD loading --------
 
 pub async fn load_config(path: &str) -> anyhow::Result<Config> {
+    info!("loading config from {}", path);
     let data = fs::read(path).with_context(|| format!("read config {path}"))?;
     let mut cfg: Config = yaml::from_slice(&data)?;
     validate_config(&cfg)?;
+    info!(
+        "config validated: storage.dir={}, limits.concurrency={}, rps={}, len={}..{}, inline_tlds={}",
+        cfg.storage.dir,
+        cfg.limits.concurrency,
+        cfg.limits.rate_per_second,
+        cfg.generator.min_length,
+        cfg.generator.max_length,
+        cfg.generator.tlds.len()
+    );
     // maybe load TLDs
     if !cfg.generator.tlds_file.trim().is_empty() {
         let src = cfg.generator.tlds_file.trim();
+        info!("loading TLDs from {}", src);
         let tlds = if src.starts_with("http://") || src.starts_with("https://") {
             load_tlds_from_url(src).await?
         } else {
@@ -194,10 +206,12 @@ pub async fn load_config(path: &str) -> anyhow::Result<Config> {
         if tlds.is_empty() {
             anyhow::bail!("no TLDs parsed from {src}");
         }
+        info!("loaded {} TLDs from {}", tlds.len(), src);
         cfg.generator.tlds = tlds;
     }
     if cfg.storage.state_file.trim().is_empty() {
         cfg.storage.state_file = Path::new(&cfg.storage.dir).join("state.json").to_string_lossy().to_string();
+        info!("storage.state_file not set, computed default: {}", cfg.storage.state_file);
     }
     Ok(cfg)
 }
@@ -249,7 +263,9 @@ pub fn load_tlds_from_file(path: &str) -> anyhow::Result<Vec<String>> {
 }
 
 pub async fn load_tlds_from_url(url: &str) -> anyhow::Result<Vec<String>> {
+    info!("fetching TLDs from URL: {}", url);
     let body = reqwest::get(url).await?.text().await?;
+    let total_lines = body.lines().count();
     let mut uniq = std::collections::BTreeSet::<String>::new();
     for line in body.lines() {
         let mut t = line.trim().to_string();
@@ -265,5 +281,6 @@ pub async fn load_tlds_from_url(url: &str) -> anyhow::Result<Vec<String>> {
         }
         uniq.insert(format!(".{}", t));
     }
+    info!("parsed {} TLDs from {} (input lines={})", uniq.len(), url, total_lines);
     Ok(uniq.into_iter().collect())
 }
