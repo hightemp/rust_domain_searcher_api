@@ -7,7 +7,7 @@ CARGO ?= cargo
 BIN ?= rust_domain_searcher_api
 BIN_DIR ?= ./bin
 CONFIG ?= ../domain_search.config.yaml
-ADDR ?= :8080
+ADDR ?= :8082
 
 .PHONY: help tidy fmt test build run reset build-linux build-macos build-windows clean
 .PHONY: install uninstall purge service-start service-stop service-restart service-status logs
@@ -51,10 +51,10 @@ build:
 	cp target/release/$(BIN) $(BIN_DIR)/$(BIN)
 
 run:
-	$(CARGO) run -- -addr $(ADDR) -config $(CONFIG)
+	$(CARGO) run -- --addr $(ADDR) --config $(CONFIG)
 
 reset:
-	$(CARGO) run -- -config $(CONFIG) -reset
+	$(CARGO) run -- --config $(CONFIG) --reset
 
 build-linux:
 	$(CARGO) build --release --target x86_64-unknown-linux-gnu
