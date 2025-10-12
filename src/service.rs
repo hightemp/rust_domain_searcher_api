@@ -125,11 +125,18 @@ pub async fn run_service(
                     info!("resume: loaded last='{}'", ld);
                 }
                 *last.write() = ld;
+                // restore progress counters if present
+                if st.enqueued > 0 || st.checked > 0 || st.found > 0 || st.total_planned > 0 {
+                    let tp = if st.total_planned > 0 { st.total_planned } else { prog.total_planned() };
+                    prog.set_initial(st.enqueued, st.checked, st.found, tp);
+                    info!("resume: restored progress enqueued={} checked={} found={} total_planned={}", st.enqueued, st.checked, st.found, tp);
+                }
             }
         }
         // periodic saver
         let state_path_clone = state_path.clone();
         let last_for_saver = last.clone();
+        let prog_for_saver = prog.clone();
         tokio::spawn(async move {
             let mut prev = String::new();
             let mut ticker = time::interval(Duration::from_secs(1));
@@ -137,7 +144,7 @@ pub async fn run_service(
                 ticker.tick().await;
                 let cur = last_for_saver.read().clone();
                 if !cur.is_empty() && cur != prev {
-                    let _ = save_resume(&state_path_clone, &cur);
+                    let _ = save_resume(&state_path_clone, &cur, &prog_for_saver);
                     debug!("resume: saved last='{}'", cur);
                     prev = cur;
                 }
@@ -198,7 +205,7 @@ pub async fn run_service(
     // final save resume
     if cfg.storage.resume {
         let cur = last_domain_cell().read().clone();
-        let _ = save_resume(&state_path, &cur);
+        let _ = save_resume(&state_path, &cur, &prog);
     }
 
     info!("service stopped");
@@ -345,13 +352,21 @@ where
     Ok(())
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Default)]
 struct ResumeState {
     last_domain: String,
     updated_at_unix: u64,
+    #[serde(default)]
+    enqueued: i64,
+    #[serde(default)]
+    checked: i64,
+    #[serde(default)]
+    found: i64,
+    #[serde(default)]
+    total_planned: i64,
 }
 
-fn save_resume(path: &Path, last: &str) -> anyhow::Result<()> {
+fn save_resume(path: &Path, last: &str, prog: &Progress) -> anyhow::Result<()> {
     if last.trim().is_empty() {
         return Ok(());
     }
@@ -359,9 +374,14 @@ fn save_resume(path: &Path, last: &str) -> anyhow::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
+    let (enq, chk, fnd, _elapsed) = prog.snapshot();
     let st = ResumeState {
         last_domain: last.trim().to_string(),
         updated_at_unix: now_unix(),
+        enqueued: enq,
+        checked: chk,
+        found: fnd,
+        total_planned: prog.total_planned(),
     };
     let data = serde_json::to_vec(&st)?;
     std::fs::write(&tmp, data)?;

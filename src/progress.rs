@@ -41,4 +41,12 @@ impl Progress {
     pub fn total_planned(&self) -> i64 {
         self.total_planned.load(Ordering::Relaxed)
     }
+
+    // Initialize counters from persisted state
+    pub fn set_initial(&self, enqueued: i64, checked: i64, found: i64, total_planned: i64) {
+        self.enqueued.store(enqueued, Ordering::Relaxed);
+        self.checked.store(checked, Ordering::Relaxed);
+        self.found.store(found, Ordering::Relaxed);
+        self.total_planned.store(total_planned.max(0), Ordering::Relaxed);
+    }
 }
