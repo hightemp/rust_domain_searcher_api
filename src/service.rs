@@ -103,6 +103,8 @@ pub async fn run_service(
                         }
                     }
                     prog.inc_checked();
+                    // update last_domain only after full processing of the candidate
+                    *last_domain_cell().write() = name.clone();
                     drop(permit);
                 });
             }
@@ -161,38 +163,26 @@ pub async fn run_service(
         let cfg_gen = cfg.generator.clone();
         let tx_gen = tx.clone();
         let last_for_gen = last_domain_cell();
-        let mut sent: i64 = 0;
 
         select! {
             _ = shutdown.wait() => {
                 break;
             }
-            _ = async {
+            res = async {
                 let resume_from = last_for_gen.read().clone();
                 info!("generator start: resume_from='{}'", resume_from);
-                if let Err(e) = generate_candidates(cfg_gen, resume_from, |d| {
-                    // report last domain
-                    *last_for_gen.write() = d.to_string();
-                    // send candidate (drop silently if channel is full)
-                    match tx_gen.try_send(d.to_string()) {
-                        Ok(_) => {
-                            sent += 1;
-                            // track enqueue for stats
-                            prog.inc_enqueued();
-                            if cfg.limits.max_candidates > 0 && sent >= cfg.limits.max_candidates as i64 {
-                                info!("generator hit max_candidates={}, stopping pass", cfg.limits.max_candidates);
-                                return false;
-                            }
-                            true
-                        }
-                        Err(_) => true,
-                    }
-                }).await {
-                    error!("generator error: {e}");
-                } else {
-                    info!("generator finished: enqueued_sent={}", sent);
-                }
+                generate_candidates(
+                    cfg_gen,
+                    resume_from,
+                    &tx_gen,
+                    &prog,
+                    cfg.limits.max_candidates as i64,
+                ).await
             } => {
+                match res {
+                    Ok(sent) => info!("generator finished: enqueued_sent={}", sent),
+                    Err(e) => error!("generator error: {e}"),
+                }
                 if !cfg.run.loop_ {
                     break;
                 }
@@ -260,10 +250,13 @@ async fn check_domain(client: &Client, domain: &str, hc: &HTTPCheckConfig) -> an
 }
 
 // generate labels and domains; resume_from is lexicographic full domain to start after
-async fn generate_candidates<F>(gen: GeneratorConfig, resume_from: String, mut emit: F) -> anyhow::Result<()>
-where
-    F: FnMut(&str) -> bool,
-{
+async fn generate_candidates(
+    gen: GeneratorConfig,
+    resume_from: String,
+    tx: &mpsc::Sender<String>,
+    prog: &Progress,
+    max_candidates: i64,
+) -> anyhow::Result<i64> {
     let alpha = if gen.alphabet.is_empty() {
         "abcdefghijklmnopqrstuvwxyz0123456789-".to_string()
     } else {
@@ -274,6 +267,7 @@ where
     let is_allowed = |c: char| allowed.contains(&c);
     let resume = resume_from.to_lowercase();
     let mut started = resume.is_empty();
+    let mut sent: i64 = 0;
 
     for ln in gen.min_length..=gen.max_length {
         let ln = ln as usize;
@@ -321,10 +315,19 @@ where
                         }
                         started = true; // dl > resume
                     }
-                    // update last
-                    *last_domain_cell().write() = domain.clone();
-                    if !emit(&domain) {
-                        return Ok(());
+                    // send with backpressure; only after successful enqueue we bump progress
+                    match tx.send(domain.clone()).await {
+                        Ok(()) => {
+                            prog.inc_enqueued();
+                            sent += 1;
+                            if max_candidates > 0 && sent >= max_candidates {
+                                return Ok(sent);
+                            }
+                        }
+                        Err(_) => {
+                            // channel closed (shutdown), stop generation gracefully
+                            return Ok(sent);
+                        }
                     }
                 }
             }
@@ -349,7 +352,7 @@ where
             tokio::task::yield_now().await;
         }
     }
-    Ok(())
+    Ok(sent)
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
