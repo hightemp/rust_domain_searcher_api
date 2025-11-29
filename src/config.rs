@@ -5,10 +5,11 @@ use serde::{Deserialize, Deserializer};
 use serde_yaml as yaml;
 
 use anyhow::Context;
-use tracing::{info, warn, error};
+use tracing::info;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
+    #[allow(dead_code)]
     pub version: i32,
     pub generator: GeneratorConfig,
     pub limits: LimitsConfig,
@@ -53,8 +54,6 @@ pub struct HTTPCheckConfig {
     pub retry: u32,
     #[serde(default)]
     pub method: String,
-    #[serde(default)]
-    pub body_limit: ByteSize,
     pub accept_status_min: i32,
     pub accept_status_max: i32,
     #[serde(default)]
@@ -76,52 +75,6 @@ pub struct StorageConfig {
     pub state_file: String,
 }
 
-// -------- ByteSize "32KB" etc --------
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ByteSize {
-    pub bytes: u64,
-}
-impl<'de> Deserialize<'de> for ByteSize {
-    fn deserialize<D>(deserializer: D) -> Result<ByteSize, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct BSVisitor;
-        impl<'de> Visitor<'de> for BSVisitor {
-            type Value = ByteSize;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("byte size like 32KB, 10MB, 123B or plain number")
-            }
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                parse_bytesize(v).map_err(E::custom)
-            }
-        }
-        deserializer.deserialize_any(BSVisitor)
-    }
-}
-
-fn parse_bytesize(s: &str) -> Result<ByteSize, String> {
-    let mut ss = s.trim().to_uppercase();
-    let (mult, strip) = if ss.ends_with("KB") {
-        (1024u64, 2)
-    } else if ss.ends_with("MB") {
-        (1024u64 * 1024, 2)
-    } else if ss.ends_with("GB") {
-        (1024u64 * 1024 * 1024, 2)
-    } else if ss.ends_with('B') {
-        (1u64, 1)
-    } else {
-        (1u64, 0)
-    };
-    if strip > 0 {
-        ss.truncate(ss.len() - strip);
-    }
-    let val = ss.trim().parse::<u64>().map_err(|e| e.to_string())?;
-    Ok(ByteSize { bytes: val.saturating_mul(mult) })
-}
 
 // -------- Duration "3s" etc --------
 fn de_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>

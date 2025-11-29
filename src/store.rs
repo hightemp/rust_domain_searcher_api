@@ -1,36 +1,73 @@
 use std::{
-    fs,
-    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicI64, Ordering},
-        Arc, Mutex,
-    },
+    sync::Arc,
+    collections::HashMap,
 };
-
-use parking_lot::RwLock;
-use tracing::error;
+use tokio::sync::mpsc;
+use tokio::time::{self, Duration};
+use tokio::io::AsyncWriteExt;
 
 #[derive(Clone)]
 pub struct DomainStore {
     dir: Arc<PathBuf>,
-    count: Arc<AtomicI64>,
-    locks: Arc<RwLock<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
+    tx: mpsc::Sender<String>,
 }
 
 impl DomainStore {
     pub fn new<P: AsRef<Path>>(dir: P) -> anyhow::Result<Self> {
-        let p = dir.as_ref();
-        fs::create_dir_all(p)?;
+        let p = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&p)?;
+        let dir_arc = Arc::new(p);
+
+        let (tx, mut rx) = mpsc::channel::<String>(10000);
+        let dir_clone = dir_arc.clone();
+
+        tokio::spawn(async move {
+            let mut buffer: HashMap<String, Vec<String>> = HashMap::new();
+            let mut last_flush = time::Instant::now();
+            // Flush every 2 seconds or if buffer is large
+            let flush_interval = Duration::from_secs(2);
+            
+            loop {
+                let timeout = time::sleep_until(last_flush + flush_interval);
+                
+                tokio::select! {
+                    msg = rx.recv() => {
+                        match msg {
+                            Some(domain) => {
+                                if let Some(tld) = Self::extract_tld(&domain) {
+                                    buffer.entry(tld).or_default().push(domain);
+                                }
+                                // Soft limit to trigger flush
+                                if buffer.len() > 500 || buffer.values().map(|v| v.len()).sum::<usize>() > 5000 {
+                                    Self::flush_buffer(&dir_clone, &mut buffer).await;
+                                    last_flush = time::Instant::now();
+                                }
+                            }
+                            None => {
+                                // Channel closed
+                                Self::flush_buffer(&dir_clone, &mut buffer).await;
+                                break;
+                            }
+                        }
+                    }
+                    _ = timeout => {
+                        if !buffer.is_empty() {
+                            Self::flush_buffer(&dir_clone, &mut buffer).await;
+                        }
+                        last_flush = time::Instant::now();
+                    }
+                }
+            }
+        });
+
         Ok(Self {
-            dir: Arc::new(p.to_path_buf()),
-            count: Arc::new(AtomicI64::new(0)),
-            locks: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            dir: dir_arc,
+            tx,
         })
     }
 
-    #[inline]
-    fn tld_from_domain(domain: &str) -> Option<String> {
+    fn extract_tld(domain: &str) -> Option<String> {
         let idx = domain.rfind('.')?;
         if idx == 0 || idx == domain.len() - 1 {
             return None;
@@ -38,34 +75,41 @@ impl DomainStore {
         Some(domain[idx + 1..].to_string())
     }
 
-    fn lock_for(&self, tld: &str) -> Arc<Mutex<()>> {
-        if let Some(m) = self.locks.read().get(tld) {
-            return m.clone();
+    async fn flush_buffer(dir: &Path, buffer: &mut HashMap<String, Vec<String>>) {
+        for (tld, domains) in buffer.drain() {
+            let path = dir.join(format!("{}.txt", tld));
+            // Use tokio fs for async writing
+            let res = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .await;
+                
+            match res {
+                Ok(mut f) => {
+                    let mut chunk = String::with_capacity(domains.len() * 20);
+                    for d in domains {
+                        chunk.push_str(&d);
+                        chunk.push('\n');
+                    }
+                    if let Err(e) = f.write_all(chunk.as_bytes()).await {
+                        tracing::error!("failed to write to {}: {}", path.display(), e);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("failed to open {}: {}", path.display(), e);
+                }
+            }
         }
-        let mut w = self.locks.write();
-        w.entry(tld.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    }
-
-    #[inline]
-    fn path_for(&self, tld: &str) -> PathBuf {
-        self.dir.join(format!("{}.txt", tld))
     }
 
     pub fn add(&self, domain: &str) {
-        let Some(tld) = Self::tld_from_domain(domain) else { return };
-        if let Err(e) = fs::create_dir_all(&*self.dir) {
-            error!("mkdir storage dir error: {e}");
-            return;
-        }
-        let lk = self.lock_for(&tld);
-        let _g = lk.lock().unwrap();
-        let path = self.path_for(&tld);
-        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{}", domain);
-            self.count.fetch_add(1, Ordering::Relaxed);
-        }
+        let d = domain.to_string();
+        let tx = self.tx.clone();
+        // We spawn a task to send to channel to avoid blocking the caller
+        tokio::spawn(async move {
+            let _ = tx.send(d).await;
+        });
     }
 
     pub fn list(&self, tld: &str) -> Vec<String> {
@@ -73,31 +117,33 @@ impl DomainStore {
         if t.is_empty() {
             return vec![];
         }
-        let path = self.path_for(&t);
-        let Ok(f) = fs::File::open(path) else { return vec![] };
-        let reader = BufReader::new(f);
-        reader
-            .lines()
-            .filter_map(|l| l.ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
+        let path = self.dir.join(format!("{}.txt", t));
+        if !path.exists() {
+            return vec![];
+        }
+        if let Ok(f) = std::fs::File::open(path) {
+             use std::io::BufRead;
+             let reader = std::io::BufReader::new(f);
+             return reader.lines().filter_map(|l| l.ok()).collect();
+        }
+        vec![]
     }
 
     pub fn list_all(&self) -> Vec<String> {
-        let mut out = Vec::with_capacity(1024);
-        let Ok(entries) = fs::read_dir(&*self.dir) else { return out };
-        for e in entries.flatten() {
-            let path = e.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("txt") {
-                continue;
-            }
-            if let Ok(f) = fs::File::open(&path) {
-                let reader = BufReader::new(f);
-                for line in reader.lines().flatten() {
-                    let s = line.trim();
-                    if !s.is_empty() {
-                        out.push(s.to_string());
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&*self.dir) {
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("txt") {
+                    if let Ok(f) = std::fs::File::open(&path) {
+                        use std::io::BufRead;
+                        let reader = std::io::BufReader::new(f);
+                        for line in reader.lines().flatten() {
+                            out.push(line);
+                            if out.len() >= 100_000 { // Safety limit
+                                return out;
+                            }
+                        }
                     }
                 }
             }
@@ -106,33 +152,29 @@ impl DomainStore {
     }
 
     pub fn approx_bytes(&self) -> u64 {
-        let Ok(entries) = fs::read_dir(&*self.dir) else { return 0 };
+        let Ok(entries) = std::fs::read_dir(&*self.dir) else { return 0 };
         let mut total = 0u64;
         for e in entries.flatten() {
-            let Ok(md) = e.metadata() else { continue };
-            total = total.saturating_add(md.len());
+            if let Ok(md) = e.metadata() {
+                total += md.len();
+            }
         }
         total
     }
 
-    pub fn total_count(&self) -> i64 {
-        self.count.load(Ordering::Relaxed)
-    }
-
     pub fn reset(&self, state_file: &str) -> anyhow::Result<()> {
-        let entries = fs::read_dir(&*self.dir)?;
+        let entries = std::fs::read_dir(&*self.dir)?;
         for e in entries {
             if let Ok(ent) = e {
                 let p = ent.path();
                 if p.extension().and_then(|s| s.to_str()) == Some("txt") {
-                    let _ = fs::remove_file(p);
+                    let _ = std::fs::remove_file(p);
                 }
             }
         }
         if !state_file.trim().is_empty() {
             let _ = std::fs::remove_file(state_file);
         }
-        self.count.store(0, Ordering::Relaxed);
         Ok(())
     }
 }

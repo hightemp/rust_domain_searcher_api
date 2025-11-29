@@ -11,8 +11,9 @@ use futures_util::StreamExt;
 use parking_lot::RwLock;
 use once_cell::sync::OnceCell;
 use reqwest::{Client, Method};
-use tokio::{select, sync::{mpsc, Semaphore}, time};
-use tracing::{error, info, debug, warn};
+use tokio::{select, sync::mpsc, time};
+use tracing::{error, info, debug};
+use hickory_resolver::{TokioAsyncResolver, config::{ResolverConfig, ResolverOpts}};
 
 use crate::config::{Config, GeneratorConfig, HTTPCheckConfig};
 use crate::progress::Progress;
@@ -54,61 +55,63 @@ pub async fn run_service(
     client: Client,
     shutdown: ShutdownSignal,
 ) {
-    let (tx, mut rx) = mpsc::channel::<String>(std::cmp::max(1, (cfg.limits.concurrency * 2) as usize));
+    // Increase channel size for buffering
+    let (tx, rx) = mpsc::channel::<String>(10000);
 
-    // RPS limiter (token bucket via semaphore + periodic refill)
-    let rps = cfg.limits.rate_per_second.max(1) as usize;
-    let limiter = Arc::new(Semaphore::new(0));
-    {
-        let refill = limiter.clone();
-        tokio::spawn(async move {
-            let mut ticker = time::interval(Duration::from_secs(1));
-            loop {
-                ticker.tick().await;
-                // Refill with rps tokens each second (bounded by consumption)
-                refill.add_permits(rps);
-            }
-        });
-    }
-    info!("rps limiter: {} tokens/sec", rps);
+    // DNS Resolver
+    let resolver = TokioAsyncResolver::tokio(
+        ResolverConfig::google(),
+        ResolverOpts::default(),
+    );
+    let resolver = Arc::new(resolver);
 
     // Concurrency limiter
-    let nw = cfg.limits.concurrency.max(1) as usize;
-    let conc = Arc::new(Semaphore::new(nw));
-    info!("concurrency limiter: {} workers", nw);
- 
-    // Single consumer that dispatches per-domain tasks respecting concurrency
+    let concurrency = cfg.limits.concurrency.max(1) as usize;
+    info!("concurrency: {} workers", concurrency);
+
+    // Pipeline: Generator -> Channel -> Stream -> DNS -> HTTP -> Store
     {
         let store = store.clone();
         let prog = prog.clone();
-        let limiter = limiter.clone();
         let client = client.clone();
         let hc = cfg.http_check.clone();
-        let conc = conc.clone();
-        tokio::spawn(async move {
-            while let Some(name) = rx.recv().await {
-                let permit = conc.clone().acquire_owned().await.unwrap();
-                let limiter = limiter.clone();
-                let store = store.clone();
-                let prog = prog.clone();
-                let client = client.clone();
-                let hc = hc.clone();
-                tokio::spawn(async move {
-                    // RPS token
-                    let _rpsp = limiter.acquire().await.unwrap();
-                    if let Ok(ok) = check_domain(&client, &name, &hc).await {
+        let resolver = resolver.clone();
+        
+        // Convert receiver to stream
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        
+        // Process stream with concurrency
+        let process_fut = stream.for_each_concurrent(concurrency, move |domain: String| {
+            let store = store.clone();
+            let prog = prog.clone();
+            let client = client.clone();
+            let hc = hc.clone();
+            let resolver = resolver.clone();
+            
+            async move {
+                // 1. DNS Resolve (Fast Filter)
+                let has_ip = match resolver.lookup_ip(&domain).await {
+                    Ok(ips) => ips.iter().next().is_some(),
+                    Err(_) => false,
+                };
+
+                if has_ip {
+                    // 2. HTTP Check (Slow Check)
+                    if let Ok(ok) = check_domain(&client, &domain, &hc).await {
                         if ok {
-                            store.add(&name);
+                            store.add(&domain);
                             prog.inc_found();
                         }
                     }
-                    prog.inc_checked();
-                    // update last_domain only after full processing of the candidate
-                    *last_domain_cell().write() = name.clone();
-                    drop(permit);
-                });
+                }
+                
+                prog.inc_checked();
+                *last_domain_cell().write() = domain.clone();
             }
         });
+
+        // Spawn processor
+        tokio::spawn(process_fut);
     }
 
     // Resume state management
@@ -141,7 +144,7 @@ pub async fn run_service(
         let prog_for_saver = prog.clone();
         tokio::spawn(async move {
             let mut prev = String::new();
-            let mut ticker = time::interval(Duration::from_secs(1));
+            let mut ticker = time::interval(Duration::from_secs(5)); // Save every 5s
             loop {
                 ticker.tick().await;
                 let cur = last_for_saver.read().clone();
@@ -154,10 +157,7 @@ pub async fn run_service(
         });
     }
 
-    // Generator task
-    // generator executed inside the select! loop below to avoid non-Send captures
-
-    // Loop control: race generation against shutdown without spawning non-Send futures
+    // Generator Loop
     info!("service entering main loop");
     loop {
         let cfg_gen = cfg.generator.clone();
@@ -186,7 +186,6 @@ pub async fn run_service(
                 if !cfg.run.loop_ {
                     break;
                 }
-                // small pause to avoid log noise
                 time::sleep(Duration::from_millis(250)).await;
             }
         }
@@ -216,25 +215,13 @@ async fn check_domain(client: &Client, domain: &str, hc: &HTTPCheckConfig) -> an
     for _attempt in 0..=hc.retry {
         for scheme in schemes {
             let url = format!("{scheme}://{domain}/");
+            // Short timeout for connection
             let req = client.request(method.clone(), &url).build()?;
             let resp = client.execute(req).await;
             match resp {
                 Ok(resp) => {
                     let status = resp.status().as_u16() as i32;
-                    // read limited body (stream chunks)
-                    let mut stream = resp.bytes_stream();
-                    let mut read: u64 = 0;
-                    let limit = hc.body_limit.bytes.max(1);
-                    while let Some(chunk) = stream.next().await {
-                        let bytes = match chunk {
-                            Ok(b) => b,
-                            Err(_) => break,
-                        };
-                        read = read.saturating_add(bytes.len() as u64);
-                        if read >= limit {
-                            break;
-                        }
-                    }
+                    // Just check status, don't read body if not needed
                     if status >= hc.accept_status_min && status <= hc.accept_status_max {
                         debug!("reachable: {} status={}", url, status);
                         return Ok(true);
@@ -300,7 +287,7 @@ async fn generate_candidates(
             }
             if valid {
                 for tld in &gen.tlds {
-                    let mut t = tld.trim().to_lowercase();
+                    let t = tld.trim().to_lowercase();
                     if t.is_empty() || !t.starts_with('.') {
                         continue;
                     }
@@ -309,25 +296,21 @@ async fn generate_candidates(
                     if !started {
                         if dl <= resume {
                             if dl == resume {
-                                started = true; // skip equal, start after it
+                                started = true; 
                             }
                             continue;
                         }
-                        started = true; // dl > resume
+                        started = true; 
                     }
-                    // send with backpressure; only after successful enqueue we bump progress
-                    match tx.send(domain.clone()).await {
-                        Ok(()) => {
-                            prog.inc_enqueued();
-                            sent += 1;
-                            if max_candidates > 0 && sent >= max_candidates {
-                                return Ok(sent);
-                            }
-                        }
-                        Err(_) => {
-                            // channel closed (shutdown), stop generation gracefully
+                    
+                    if tx.send(domain.clone()).await.is_ok() {
+                        prog.inc_enqueued();
+                        sent += 1;
+                        if max_candidates > 0 && sent >= max_candidates {
                             return Ok(sent);
                         }
+                    } else {
+                        return Ok(sent);
                     }
                 }
             }

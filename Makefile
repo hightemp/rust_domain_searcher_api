@@ -54,6 +54,9 @@ build:
 run:
 	$(CARGO) run -- --addr $(ADDR) --config $(CONFIG)
 
+run-test:
+	$(CARGO) run -- --addr 8811 --config test/test.config.yaml
+
 run-debug:
 	RUST_LOG=debug RUST_BACKTRACE=1 $(CARGO) run -- --addr $(ADDR) --config $(CONFIG)
 
